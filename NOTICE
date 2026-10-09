@@ -1,0 +1,7 @@
+ComfyUI-Iris
+ComfyUI port of the Iris-3B model architecture by Speridlabs
+(https://github.com/speridlabs/iris-3b, Apache License 2.0). The model code in iris/model.py
+is a reimplementation of src/iris3b/models/dit.py on ComfyUI's ops; parameter names follow
+the original so the released weights load unchanged.
+
+Iris-3B weights: https://huggingface.co/speridlabs/iris-3b (Apache License 2.0).

@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-iris"
+version = "0.1.0"
+description = "Native ComfyUI support for Iris-3B, a pixel-space text-to-image diffusion transformer. No extra requirements."
+authors = [{ name = "Nynxz", email = "contact@nynxz.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.comfy]
+PublisherId = "nynxz"
+DisplayName = "Iris"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 130
