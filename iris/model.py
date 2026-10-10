@@ -28,6 +28,9 @@ from comfy.ldm.flux.math import apply_rope, rope
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder, get_1d_sincos_pos_embed_from_grid_torch
 
+# RoPE frequency pairs that tag in-context reference images; must match the edit LoRA's training
+EDIT_FRAME_PAIRS = 2
+
 # the Qwen3-VL assistant-turn suffix "<|im_end|>\n<|im_start|>assistant\n" is 5 tokens; the
 # reference truncates the caption, never the suffix, so an over-long prompt keeps its tail
 TEXT_SUFFIX_TOKENS = 5
@@ -46,19 +49,27 @@ def attention(q, k, v, heads, comfy_attention, mask=None, transformer_options={}
     )
 
 
-def rope_2d(head_dim, height, width, theta, scale, device):
+def rope_2d(head_dim, height, width, theta, scale, device, frame_pairs=0, frame_index=0, frame_theta=10.0):
     """Isotropic axial 2D RoPE (reference ``rope_aspect="isotropic"``).
 
     One step shared by both axes so the long side spans [0, scale] and aspect ratio survives.
-    Flux-format rotations [H*W, head_dim/2, 2, 2], (x, y) frequency pairs interleaved.
+    ``frame_pairs`` hands the slowest (x, y) pairs to a frame axis that tags in-context
+    reference images (target = frame 0). Flux-format rotations [H*W, head_dim/2, 2, 2].
     """
+    n_pairs = head_dim // 4
+    freqs = 1.0 / theta ** (torch.arange(0, head_dim, 4, device=device)[:n_pairs].float() / head_dim)
+    freqs = freqs[:n_pairs - frame_pairs]
     step = scale / max(max(height, width) - 1, 1)
-    ys = torch.arange(height, device=device, dtype=torch.float32) * step
-    xs = torch.arange(width, device=device, dtype=torch.float32) * step
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    rope_x = rope(grid_x.reshape(1, -1), head_dim // 2, theta).squeeze(0)
-    rope_y = rope(grid_y.reshape(1, -1), head_dim // 2, theta).squeeze(0)
-    return torch.stack([rope_x, rope_y], dim=2).reshape(height * width, head_dim // 2, 2, 2)
+    ang_x = torch.outer(torch.arange(width, device=device, dtype=torch.float32) * step, freqs)
+    ang_y = torch.outer(torch.arange(height, device=device, dtype=torch.float32) * step, freqs)
+    ang = torch.stack([ang_x[None].expand(height, -1, -1), ang_y[:, None].expand(-1, width, -1)], dim=-1)
+    ang = ang.reshape(height * width, -1)
+    if frame_pairs:
+        slots = 2 * frame_pairs
+        frame = frame_index / frame_theta ** (torch.arange(slots, device=device, dtype=torch.float32) / slots)
+        ang = torch.cat([ang, frame.expand(height * width, -1)], dim=-1)
+    cos, sin = ang.cos(), ang.sin()
+    return torch.stack([cos, -sin, sin, cos], dim=-1).view(height * width, head_dim // 2, 2, 2)
 
 
 def rope_1d(head_dim, length, theta, device):
@@ -472,7 +483,7 @@ class IrisDiT(nn.Module):
             comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options),
         ).execute(x, timesteps, context, attention_mask, transformer_options, **kwargs)
 
-    def _forward(self, x, timesteps, context=None, attention_mask=None, transformer_options={}, **kwargs):
+    def _forward(self, x, timesteps, context=None, attention_mask=None, transformer_options={}, ref_latents=None, **kwargs):
         p = self.patch_size
         h_orig, w_orig = x.shape[-2:]
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (p, p))
@@ -487,16 +498,30 @@ class IrisDiT(nn.Module):
         y = self.y_embedder(context, text_mask, transformer_options=transformer_options)
         y = y + comfy.model_management.cast_to(self.y_pos_embedding, dtype=y.dtype, device=y.device)
 
-        pe_img = rope_2d(head_dim, grid_h, grid_w, self.rope_theta, self.rope_scale, x.device)
+        # in-context editing: clean reference images join the patch trunk as extra tokens on
+        # their own grid, tagged frame 1..N; the pixel stage only decodes the target
+        refs = ref_latents or []
+        frame_pairs = EDIT_FRAME_PAIRS if refs else 0
+        pe_img = [rope_2d(head_dim, grid_h, grid_w, self.rope_theta, self.rope_scale, x.device, frame_pairs)]
+        ref_tokens = []
+        for i, ref in enumerate(refs):
+            ref = comfy.ldm.common_dit.pad_to_patch_size(ref.to(x), (p, p))
+            ref_tokens.append(self.s_embedder(F.unfold(ref, kernel_size=p, stride=p).transpose(1, 2)))
+            pe_img.append(rope_2d(head_dim, ref.shape[-2] // p, ref.shape[-1] // p, self.rope_theta,
+                                  self.rope_scale, x.device, frame_pairs, frame_index=i + 1))
+        pe_img = torch.cat(pe_img, dim=0)
         pe_txt = rope_1d(head_dim, y.shape[1], self.text_rope_theta, x.device)
         core_img = self.modulation_cores["adaln_img"](cond)
         core_txt = self.modulation_cores["adaln_txt"](cond)
 
         s = self.s_embedder(F.unfold(x, kernel_size=p, stride=p).transpose(1, 2))
+        n_target = s.shape[1]
+        if ref_tokens:
+            s = torch.cat([s, *ref_tokens], dim=1)
         for i, block in enumerate(self.blocks):
             s, y = block(s, y, core_img, core_txt, pe_img, pe_txt, last=i == len(self.blocks) - 1,
                          transformer_options=transformer_options)
-        s = F.silu(t_emb + s)  # timestep re-fused into every patch token
+        s = F.silu(t_emb + s[:, :n_target])  # timestep re-fused into every target patch token
 
         s_cond = s.reshape(-1, s.shape[-1])
         pe_pix = rope_2d(self.pixel_attn_head_dim, grid_h, grid_w, self.rope_theta, self.rope_scale, x.device)

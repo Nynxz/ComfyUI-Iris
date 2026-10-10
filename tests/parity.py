@@ -72,16 +72,51 @@ def random_config_test():
     with torch.no_grad():
         for p in ref.parameters():  # adaLN-zero init would make most blocks identity
             p.normal_(0, 0.05)
-    from iris.integration import detect_iris_config
+    from iris.integration import detect_iris_config, pad_mlp
 
     sd = ref.state_dict()
     config = detect_iris_config(sd)
+    sd = pad_mlp(dict(sd))
     config["text_layer_heads"] = 4  # the layer-attention head count is not visible in shapes
     port = port_model(config)
     missing, unexpected = port.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, (missing, unexpected)
     err, cos = compare(ref, port, 64, 96, 20, 3, 64, real_tokens=(7, 20))
     print(f"random config 64x96: relerr {err:.2e}  cos {cos:.8f}")
+    assert err < 1e-4, err
+
+
+def edit_test(irisedit_repo):
+    """The port with a reference image vs IrisEdit's training forward (frame-tagged refs)."""
+    sys.path.insert(0, irisedit_repo)
+    from irisedit import model as edit_model
+    from iris.integration import detect_iris_config, pad_mlp
+
+    torch.manual_seed(1)
+    ref_model = reference_model(hidden_size=256, depth=4, dual_depth=2, num_heads=4, num_kv_heads=2, text_dim=64,
+                                text_len=20, text_lap_num_layers=3, text_lap_num_heads=4, rope_frame_pairs=2,
+                                pixel={"hidden_size": 8, "attn_hidden_size": 64, "num_heads": 2, "depth": 2})
+    with torch.no_grad():
+        for p in ref_model.parameters():
+            p.normal_(0, 0.05)
+    config = detect_iris_config(ref_model.state_dict())
+    config["text_layer_heads"] = 4
+    port = port_model(config)
+    port.load_state_dict(pad_mlp(dict(ref_model.state_dict())))
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(2, 3, 64, 96, generator=g)
+    ref = torch.rand(2, 3, 64, 96, generator=g) * 2 - 1
+    t = torch.tensor([700.0, 250.0])
+    mask = torch.zeros(2, 20, dtype=torch.long)
+    mask[:, :9] = 1
+    y = torch.randn(2, 20, 3, 64, generator=g) * mask[:, :, None, None]
+    with torch.no_grad():
+        out_ref = edit_model.forward(ref_model, x, [ref], t, y, mask)
+        out_port = port(x, t, context=y[:, :9].reshape(2, 9, 3 * 64), ref_latents=[ref])
+        no_ref = port(x, t, context=y[:, :9].reshape(2, 9, 3 * 64))
+    err = ((out_port - out_ref).norm() / out_ref.norm()).item()
+    moved = ((no_ref - out_ref).norm() / out_ref.norm()).item()
+    print(f"edit (reference image) vs IrisEdit trainer: relerr {err:.2e}  (without the reference: {moved:.2e})")
     assert err < 1e-4, err
 
 
@@ -97,7 +132,7 @@ def checkpoint_test(path):
     assert type(comfy.model_detection.model_config_from_unet_config(config, sd)) is Iris
 
     port = port_model(config)
-    missing, unexpected = port.load_state_dict(sd, strict=False)
+    missing, unexpected = port.load_state_dict(Iris(config).process_unet_state_dict(dict(sd)), strict=False)
     assert not missing and not unexpected, (missing, unexpected)
     ref = reference_model()
     ref.load_state_dict(sd, strict=True)
@@ -112,12 +147,15 @@ def main():
     ap.add_argument("--comfy", required=True)
     ap.add_argument("--ref", required=True)
     ap.add_argument("--checkpoint")
+    ap.add_argument("--irisedit", help="IrisEdit repo: also check the edit path against its trainer")
     args = ap.parse_args()
     setup_paths(args.comfy, args.ref)
     from iris.integration import register
 
     register()
     random_config_test()
+    if args.irisedit:
+        edit_test(args.irisedit)
     if args.checkpoint:
         checkpoint_test(args.checkpoint)
     print("OK")
