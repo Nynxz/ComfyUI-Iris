@@ -37,7 +37,7 @@ You can also load the original FP32 `model.safetensors` from
 |---|---|---|
 | Size | 6.0 GB | 3.4 GB |
 | Speed (RTX 5090, 1024², 50 steps, CFG 3) | 15.8 s | **9.5 s** |
-| Quality | the original model | very close: same composition, ~30 dB PSNR vs bf16 |
+| Quality | the original model | very close: same composition, ~35 dB PSNR vs bf16 (`res_multistep`) |
 | GPU | any | RTX 20-series or newer (int8 tensor cores) |
 
 **bf16** keeps every weight in bfloat16, which is the precision ComfyUI runs the original model at anyway.
@@ -61,7 +61,7 @@ text-to-image graph:
 | ModelSamplingSD3 | shift **4** (the default; optional) |
 | Empty Latent Image | about 1 megapixel, sides a multiple of 16 (e.g. 1024×1024, 1216×832) |
 | CLIP Text Encode (negative) | **leave empty** |
-| KSampler | `euler` / `simple`, 30–50 steps, CFG **3** |
+| KSampler | `res_multistep` / `simple`, **50** steps, CFG **3** (`euler` works too) |
 
 **Tips**
 
@@ -73,6 +73,45 @@ text-to-image graph:
 - **Exact reference sampler:** the official samples use 100 steps of DPM-Solver++(2M) at CFG 3.
   To reproduce that, use **SamplerCustom** + **SamplerDPMPP_2M_SDE** (`eta 0`, `midpoint`) +
   **BasicScheduler** (`simple`, 100 steps). Plain `dpmpp_2m` is a different formula for flow models.
+
+## Editing (experimental)
+
+Iris can edit an input image with an edit LoRA trained by
+[IrisEdit](https://github.com/Nynxz/IrisEdit) (the same in-context recipe as Flux Kontext / NK2E).
+The pack handles the reference image natively, so the graph is stock nodes:
+**[example_workflows/iris-3b_edit.json](example_workflows/iris-3b_edit.json)**.
+
+- Load Image → VAE Encode (`pixel_space`) → **ReferenceLatent on both the positive and the
+  negative**. Without the reference on the negative, CFG amplifies copying the source and the
+  edit vanishes.
+- Positive: the instruction as plain text. Negative: empty.
+- Load the LoRA with LoraLoaderModelOnly. It works on the bf16, fp32 and int8 files.
+- Don't use ConditioningMultiply, Kontext reference-method nodes or vision-token prompt encoders.
+  Iris reads at most 300 text tokens and its adapter has never seen image tokens.
+
+The reference images go through the patch trunk as extra tokens, tagged on a reserved RoPE
+frame axis. The pixel stage only decodes the output. Text-to-image is unchanged when no reference
+is attached.
+
+## Upscaling and depth
+
+Iris-3B ships fine-tunes for image restoration/upscaling and monocular depth. Both run with
+stock nodes:
+
+- **Upscale x4**: [example_workflows/iris-3b_upscale.json](example_workflows/iris-3b_upscale.json).
+  Use the upscaler as a **LoRA on base Iris** (`iris-3b-upscaler_r128`, 0.5 GB, extracted with
+  `scripts/extract_lora.py`; its output matches the full fine-tune at ~37 dB PSNR) or as a full
+  checkpoint. The graph is a bicubic x4 upsample, then VAE Encode, then **LatentMultiply x2**, then
+  KSamplerAdvanced with one step 0.5 -> 0 (add_noise disable, steps 2, start 1, CFG 1, shift 1).
+  The x2 cancels the sampler's (1 - sigma) input scaling, so the step is exactly the released
+  restorer. It is trained on 1024 tiles, so 256-384 px inputs work best (no tiling here).
+- **Depth**: [example_workflows/iris-3b_depth.json](example_workflows/iris-3b_depth.json), using the
+  folded checkpoint (`scripts/fold_depth.py`). The pack recognises it (file tag
+  `iris_task=depth`) and returns the model output as the image. Use one KSamplerAdvanced step
+  with no added noise. The result is relative log depth (dark = near).
+
+Depth is a checkpoint, not a LoRA. A LoRA can't change how the sampler turns model output into
+an image, and depth needs that.
 
 ## Making the weights
 
@@ -112,8 +151,7 @@ python tests/e2e.py --comfy <ComfyUI> --out out --unet iris-3b_bf16.safetensors 
 
 ## Not yet supported
 
-Iris-3B also ships fine-tunes for monocular depth and image restoration/upscaling. They are
-not wired up here yet.
+The edit LoRA is still training.
 
 ## Credits & license
 

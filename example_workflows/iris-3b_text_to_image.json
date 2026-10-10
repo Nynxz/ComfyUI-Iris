@@ -312,7 +312,7 @@
         "fixed",
         50,
         3.0,
-        "euler",
+        "res_multistep",
         "simple",
         1.0
       ]
@@ -406,7 +406,7 @@
         "Node name for S&R": "MarkdownNote"
       },
       "widgets_values": [
-        "## Iris-3B: text to image\n\nPixel-space model, so there is no real VAE: **Load VAE \u2192 `pixel_space`**.\n\n- **Model**: `iris-3b_bf16` or `iris-3b_int8_convrot` from huggingface.co/nynxz/iris-3b (int8 is ~1.7x faster, needs an RTX 20-series or newer).\n- **Text encoder**: `qwen3vl_4b_bf16.safetensors`, CLIP type **krea2**.\n- **Negative**: leave **empty**. The empty prompt is Iris's CFG null; don't use Conditioning Zero Out.\n- **Size**: ~1 megapixel, sides multiples of 16.\n- **Sampler**: euler / simple, 30-50 steps, CFG 3. Shift 4 (ModelSamplingSD3).\n"
+        "## Iris-3B: text to image\n\nPixel-space model, so there is no real VAE: **Load VAE \u2192 `pixel_space`**.\n\n- **Model**: `iris-3b_bf16` or `iris-3b_int8_convrot` from huggingface.co/nynxz/iris-3b (int8 is ~1.7x faster, needs an RTX 20-series or newer).\n- **Text encoder**: `qwen3vl_4b_bf16.safetensors`, CLIP type **krea2**.\n- **Negative**: leave **empty**. The empty prompt is Iris's CFG null; don't use Conditioning Zero Out.\n- **Size**: ~1 megapixel, sides multiples of 16.\n- **Sampler**: res_multistep / simple, 50 steps, CFG 3 (euler also works). Shift 4 (ModelSamplingSD3).\n"
       ]
     }
   ],
